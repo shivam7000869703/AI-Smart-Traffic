@@ -9,6 +9,15 @@ import numpy as np
 import sqlite3
 from datetime import datetime
 
+# Optimize PyTorch CPU threading for cloud container environments (Render/Docker)
+torch.set_grad_enabled(False)
+if not torch.cuda.is_available():
+    torch.set_num_threads(2)
+    try:
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+
 # ---------------------------------------------------------
 # AI SMART TRAFFIC MANAGEMENT SYSTEM
 # 4-SIDE INTERSECTION ANALYSIS
@@ -490,6 +499,14 @@ def load_model():
 
     model = YOLO("yolo11n.pt")
 
+    # Warm-up model to eliminate cold-start delay
+    try:
+        dummy = np.zeros((384, 384, 3), dtype=np.uint8)
+        with torch.inference_mode():
+            model.predict(dummy, imgsz=384, device="cpu", verbose=False)
+    except Exception:
+        pass
+
     return model
 
 
@@ -555,7 +572,7 @@ def calculate_density(average):
 # ANALYZE ONE SIDE
 # ---------------------------------------------------------
 
-def run_analysis(video_path):
+def run_analysis(video_path, imgsz=384, vid_stride=3):
 
     model = load_model()
 
@@ -565,27 +582,20 @@ def run_analysis(video_path):
     else:
         device = "cpu"
 
-    results = model.track(
-        source=video_path,
-        stream=True,
-
-        device=device,
-
-        # Improved detection settings
-        imgsz=512,
-        conf=0.20,
-        iou=0.45,
-
-        # Allow more detections
-        max_det=300,
-
-        # Analyze every frame
-        vid_stride=1,
-
-        tracker="bytetrack.yaml",
-
-        verbose=False
-    )
+    with torch.inference_mode():
+        results = model.track(
+            source=video_path,
+            stream=True,
+            device=device,
+            imgsz=imgsz,
+            conf=0.20,
+            iou=0.45,
+            classes=[2, 3, 5, 7],
+            max_det=150,
+            vid_stride=vid_stride,
+            tracker="bytetrack.yaml",
+            verbose=False
+        )
 
     # Unique tracking IDs
     unique_ids = {
@@ -741,7 +751,7 @@ def run_analysis(video_path):
 # IMAGE ANALYSIS - ONE DIRECTION
 # ---------------------------------------------------------
 
-def run_image_analysis(image):
+def run_image_analysis(image, imgsz=384):
 
     model = load_model()
 
@@ -750,15 +760,24 @@ def run_image_analysis(image):
     else:
         device = "cpu"
 
-    result = model.predict(
-        source=image,
-        device=device,
-        imgsz=512,
-        conf=0.20,
-        iou=0.45,
-        max_det=300,
-        verbose=False
-    )[0]
+    # Pre-resize high-resolution images to prevent memory spikes & CPU latency
+    h, w = image.shape[:2]
+    max_dim = 1024
+    if max(h, w) > max_dim:
+        scale = max_dim / max(h, w)
+        image = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+    with torch.inference_mode():
+        result = model.predict(
+            source=image,
+            device=device,
+            imgsz=imgsz,
+            conf=0.20,
+            iou=0.45,
+            classes=[2, 3, 5, 7],
+            max_det=150,
+            verbose=False
+        )[0]
 
     counts = {
         2: 0,  # Cars
@@ -974,10 +993,33 @@ if page == "Dashboard":
 
     st.write("")
 
-    video_report_name = st.text_input(
-        "📝 Report Name / Location (optional)",
-        placeholder="e.g. Hamidia Road Chauraha - Morning Peak",
-        key="video_report_name"
+    v_col1, v_col2 = st.columns([1.5, 1])
+    with v_col1:
+        video_report_name = st.text_input(
+            "📝 Report Name / Location (optional)",
+            placeholder="e.g. Hamidia Road Chauraha - Morning Peak",
+            key="video_report_name"
+        )
+    with v_col2:
+        video_speed_mode = st.selectbox(
+            "⚡ Video Processing Speed",
+            [
+                "Fast (Skip frames, 4x Faster - Recommended)",
+                "Balanced (2x Faster)",
+                "Full Frame-by-Frame (Slow)"
+            ],
+            index=0,
+            key="v_speed_mode",
+            help="Fast mode tracks vehicles smoothly while sampling frames every 0.1s, saving minutes on CPU."
+        )
+
+    v_speed_config = {
+        "Fast (Skip frames, 4x Faster - Recommended)": (384, 4),
+        "Balanced (2x Faster)": (480, 2),
+        "Full Frame-by-Frame (Slow)": (512, 1)
+    }
+    selected_v_imgsz, selected_vid_stride = v_speed_config.get(
+        video_speed_mode, (384, 4)
     )
 
     analyze_button = st.button(
@@ -1030,7 +1072,9 @@ if page == "Dashboard":
                 try:
 
                     result = run_analysis(
-                        video_path
+                        video_path,
+                        imgsz=selected_v_imgsz,
+                        vid_stride=selected_vid_stride
                     )
 
                     side_results[side] = result
@@ -1509,11 +1553,32 @@ elif page == "Image Analysis":
 
     st.markdown("---")
 
-    image_report_name = st.text_input(
-        "📝 Report Name / Location (optional)",
-        placeholder="e.g. Hamidia Road Chauraha - Evening",
-        key="image_report_name"
-    )
+    i_col1, i_col2 = st.columns([1.5, 1])
+    with i_col1:
+        image_report_name = st.text_input(
+            "📝 Report Name / Location (optional)",
+            placeholder="e.g. Hamidia Road Chauraha - Evening",
+            key="image_report_name"
+        )
+    with i_col2:
+        image_speed_mode = st.selectbox(
+            "⚡ Analysis Speed",
+            [
+                "Fast (384px - Recommended for Cloud)",
+                "Balanced (480px)",
+                "High Precision (512px)"
+            ],
+            index=0,
+            key="i_speed_mode",
+            help="Fast mode processes high-resolution images in 1-2 seconds with high accuracy."
+        )
+
+    i_speed_config = {
+        "Fast (384px - Recommended for Cloud)": 384,
+        "Balanced (480px)": 480,
+        "High Precision (512px)": 512
+    }
+    selected_imgsz = i_speed_config.get(image_speed_mode, 384)
 
     analyze_images = st.button(
         "🖼️ Analyze All Four Images",
@@ -1555,7 +1620,10 @@ elif page == "Image Analysis":
                     st.error(f"Could not read {side} image.")
                     st.stop()
 
-                image_results[side] = run_image_analysis(image)
+                image_results[side] = run_image_analysis(
+                    image,
+                    imgsz=selected_imgsz
+                )
 
                 progress.progress((index + 1) / 4)
 
