@@ -494,9 +494,8 @@ def clear_all_history():
         conn.close()
 
 
-# Make sure database exists and model is pre-warmed on app startup
+# Make sure database exists on app startup
 init_db()
-load_model()
 
 
 # ---------------------------------------------------------
@@ -517,6 +516,10 @@ def load_model():
         pass
 
     return model
+
+
+# Pre-warm model on startup after definition
+load_model()
 
 
 # ---------------------------------------------------------
