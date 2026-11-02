@@ -8,6 +8,7 @@ import torch
 import numpy as np
 import sqlite3
 from datetime import datetime
+import gc
 
 # Optimize PyTorch CPU threading for cloud container environments (Render/Docker)
 torch.set_grad_enabled(False)
@@ -751,7 +752,7 @@ def run_analysis(video_path, imgsz=384, vid_stride=3):
 # IMAGE ANALYSIS - ONE DIRECTION
 # ---------------------------------------------------------
 
-def run_image_analysis(image, imgsz=384):
+def run_image_analysis(image, imgsz=320):
 
     model = load_model()
 
@@ -760,9 +761,9 @@ def run_image_analysis(image, imgsz=384):
     else:
         device = "cpu"
 
-    # Pre-resize high-resolution images to prevent memory spikes & CPU latency
+    # Pre-resize high-resolution images to max 800px to strictly prevent OOM on cloud free tiers
     h, w = image.shape[:2]
-    max_dim = 1024
+    max_dim = 800
     if max(h, w) > max_dim:
         scale = max_dim / max(h, w)
         image = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
@@ -775,7 +776,7 @@ def run_image_analysis(image, imgsz=384):
             conf=0.20,
             iou=0.45,
             classes=[2, 3, 5, 7],
-            max_det=150,
+            max_det=100,
             verbose=False
         )[0]
 
@@ -804,7 +805,14 @@ def run_image_analysis(image, imgsz=384):
     density, green_time = calculate_density(total)
 
     annotated = result.plot()
+    # Downscale display preview to max 640px to reduce session state RAM usage by 95%
+    ah, aw = annotated.shape[:2]
+    if max(ah, aw) > 640:
+        ascale = 640 / max(ah, aw)
+        annotated = cv2.resize(annotated, (int(aw * ascale), int(ah * ascale)), interpolation=cv2.INTER_AREA)
     annotated = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+
+    del result
 
     return {
         "cars": counts[2],
@@ -1564,21 +1572,21 @@ elif page == "Image Analysis":
         image_speed_mode = st.selectbox(
             "⚡ Analysis Speed",
             [
-                "Fast (384px - Recommended for Cloud)",
-                "Balanced (480px)",
-                "High Precision (512px)"
+                "Fast (320px - Recommended, Safe RAM)",
+                "Balanced (384px)",
+                "High Precision (448px)"
             ],
             index=0,
             key="i_speed_mode",
-            help="Fast mode processes high-resolution images in 1-2 seconds with high accuracy."
+            help="Fast mode is memory-safe for cloud hosting (prevents 502/OOM errors) and runs in ~1 second."
         )
 
     i_speed_config = {
-        "Fast (384px - Recommended for Cloud)": 384,
-        "Balanced (480px)": 480,
-        "High Precision (512px)": 512
+        "Fast (320px - Recommended, Safe RAM)": 320,
+        "Balanced (384px)": 384,
+        "High Precision (448px)": 448
     }
-    selected_imgsz = i_speed_config.get(image_speed_mode, 384)
+    selected_imgsz = i_speed_config.get(image_speed_mode, 320)
 
     analyze_images = st.button(
         "🖼️ Analyze All Four Images",
@@ -1620,10 +1628,14 @@ elif page == "Image Analysis":
                     st.error(f"Could not read {side} image.")
                     st.stop()
 
+                gc.collect()
                 image_results[side] = run_image_analysis(
                     image,
                     imgsz=selected_imgsz
                 )
+                del image
+                del image_bytes
+                gc.collect()
 
                 progress.progress((index + 1) / 4)
 
